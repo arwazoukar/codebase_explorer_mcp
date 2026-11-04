@@ -432,3 +432,169 @@ def test_clear_cache_project(tmp_path):
     result = server.clear_cache(str(root))
     assert "entries removed" in result
 
+
+# ==========================================
+# Centralized security validation tests
+# ==========================================
+
+SECRET_FILES = [
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    "id_rsa",
+    "id_rsa.pub",
+    "id_ed25519",
+    "id_ed25519.pub",
+    "id_dsa",
+    "id_ecdsa",
+    "cert.pem",
+    "server.key",
+    "ca.crt",
+    "credentials",
+    "secrets.json",
+    "password.txt",
+    ".netrc",
+    ".npmrc",
+]
+
+GIT_FILES = [
+    ".git/config",
+    ".git/HEAD",
+    ".git/refs/heads/main",
+]
+
+
+def _assert_blocked(result):
+    assert "error" in result.lower(), f"expected blocked, got: {result!r}"
+
+
+@pytest.mark.parametrize("name", SECRET_FILES + GIT_FILES)
+def test_read_file_blocks_sensitive_files(tmp_path, name):
+    root = _make_project(tmp_path, {name: "sensitive content\n", "safe.py": "x = 1\n"})
+    result = server.read_file(str(root), name)
+    _assert_blocked(result)
+
+
+def test_read_file_blocks_sensitive_file_in_subdirectory(tmp_path):
+    root = _make_project(tmp_path, {
+        "sub/.env": "SECRET=1\n",
+        "sub/safe.py": "x = 1\n",
+    })
+    result = server.read_file(str(root), "sub/.env")
+    _assert_blocked(result)
+    # Normal file in the same folder is still readable.
+    ok = server.read_file(str(root), "sub/safe.py")
+    assert "x = 1" in ok
+
+
+def test_read_file_blocks_traversal_to_sensitive_outside_root(tmp_path):
+    root = _make_project(tmp_path, {"safe.py": "x = 1\n"})
+    (tmp_path / ".env").write_text("SECRET=1\n", encoding="utf-8")
+    result = server.read_file(str(root), "..\\..\\.env")
+    _assert_blocked(result)
+
+
+@pytest.mark.parametrize("name", SECRET_FILES + GIT_FILES)
+def test_list_files_excludes_sensitive_files(tmp_path, name):
+    root = _make_project(tmp_path, {name: "x\n", "safe.py": "x = 1\n"})
+    listing = server.list_files(str(root), ".")
+    assert name not in listing
+    assert "safe.py" in listing
+
+
+@pytest.mark.parametrize("name", SECRET_FILES + GIT_FILES)
+def test_get_file_tree_excludes_sensitive_files(tmp_path, name):
+    root = _make_project(tmp_path, {name: "x\n", "safe.py": "x = 1\n"})
+    tree = server.get_file_tree(str(root), ".", max_depth=1)
+    assert name not in tree
+    assert "safe.py" in tree
+
+
+def test_get_file_tree_excludes_git_directory(tmp_path):
+    root = _make_project(tmp_path, {
+        ".git/config": "[core]\n",
+        "safe.py": "x = 1\n",
+    })
+    tree = server.get_file_tree(str(root), ".", max_depth=1)
+    assert ".git" not in tree
+    assert "safe.py" in tree
+
+
+@pytest.mark.parametrize("name", SECRET_FILES)
+def test_search_code_does_not_expose_sensitive_content(tmp_path, name):
+    root = _make_project(tmp_path, {
+        name: "SECRET_TOKEN=abc123\n",
+        "safe.py": "SECRET_TOKEN=abc123\n",
+    })
+    # The secret only appears in plain text inside the sensitive file.
+    result = server.search_code(str(root), "SECRET_TOKEN")
+    assert "safe.py" in result
+    assert name not in result
+
+
+def test_git_directory_blocked_through_every_tool(tmp_path):
+    root = _make_project(tmp_path, {
+        ".git/config": "[core]\n",
+        "safe.py": "x = 1\n",
+    })
+    _assert_blocked(server.read_file(str(root), ".git/config"))
+    _assert_blocked(server.read_file(str(root), ".git/HEAD"))
+    listing = server.list_files(str(root), ".")
+    assert ".git" not in listing
+    tree = server.get_file_tree(str(root), ".", max_depth=2)
+    assert ".git" not in tree
+    result = server.search_code(str(root), "core")
+    assert ".git" not in result
+
+
+def test_normal_files_still_accessible_through_every_tool(tmp_path):
+    root = _make_project(tmp_path, {
+        "main.py": "def hello():\n    return 1\n",
+        "utils/helper.py": "x = 2\n",
+    })
+    assert "def hello" in server.read_file(str(root), "main.py")
+    assert "main.py" in server.list_files(str(root), ".")
+    assert "main.py" in server.get_file_tree(str(root), ".")
+    assert "hello" in server.search_code(str(root), "hello")
+    assert "hello" in server.find_definitions(str(root), ".")
+    assert "Total files scanned: 2" in server.get_project_overview(str(root))
+
+
+def test_validate_accessible_path_blocks_sensitive_and_traversal(tmp_path):
+    root = _make_project(tmp_path, {
+        ".env": "s\n",
+        ".env.local": "s\n",
+        "id_rsa": "s\n",
+        "cert.pem": "s\n",
+        ".git/config": "c\n",
+        "safe.py": "x = 1\n",
+    })
+
+    with pytest.raises(ValueError):
+        server.validate_accessible_path(root, ".env")
+    with pytest.raises(ValueError):
+        server.validate_accessible_path(root, ".env.local")
+    with pytest.raises(ValueError):
+        server.validate_accessible_path(root, "id_rsa")
+    with pytest.raises(ValueError):
+        server.validate_accessible_path(root, "cert.pem")
+    with pytest.raises(ValueError):
+        server.validate_accessible_path(root, ".git/config")
+    with pytest.raises(ValueError):
+        server.validate_accessible_path(root, "..\\safe.py")
+
+    # Normal files resolve fine.
+    assert server.validate_accessible_path(root, "safe.py").name == "safe.py"
+
+
+def test_is_path_blocked_filters_sensitive_and_git(tmp_path):
+    root = _make_project(tmp_path, {
+        ".env": "s\n",
+        ".git/config": "c\n",
+        "safe.py": "x = 1\n",
+    })
+    assert server.is_path_blocked(root, root / ".env")
+    assert server.is_path_blocked(root, root / ".git" / "config")
+    assert not server.is_path_blocked(root, root / "safe.py")
+

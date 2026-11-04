@@ -129,8 +129,15 @@ NESTED_QUANTIFIER_RE = re.compile(
 # Helper Functions
 # ==========================================
 
-def is_sensitive_file(filename: str) -> bool:
-    name = filename.lower()
+def is_sensitive_name(name: str) -> bool:
+    """Return True if a bare file or directory name is sensitive.
+
+    Operates on the name only (no directory components), so a file like
+    `.env`, `id_rsa`, or `cert.pem` is blocked anywhere inside the project.
+    Comparison is case-insensitive.
+    """
+
+    name = name.lower()
     suffix = Path(name).suffix
 
     if name in SENSITIVE_FILES:
@@ -145,8 +152,6 @@ def is_sensitive_file(filename: str) -> bool:
     if suffix in SENSITIVE_SUFFIXES:
         return True
 
-    # Names like "passwords.txt" or "secrets.json" are blocked,
-    # but real source-code files (password_utils.py) are allowed.
     if suffix not in SOURCE_CODE_SUFFIXES:
         for token in SENSITIVE_NAME_TOKENS:
             if token in name:
@@ -157,12 +162,14 @@ def is_sensitive_file(filename: str) -> bool:
 
 def is_path_blocked(root: Path, path: Path) -> bool:
     """
-    Return True if the path should be skipped or blocked:
+    Return True if the path should be skipped while walking a project:
     - Outside the project root
     - Inside an ignored directory (.git, node_modules, etc.)
     - A symbolic link
-    - A sensitive file
+    - A sensitive file or directory
     - A blocked file extension
+
+    This is a filter used by directory-walking tools; it never raises.
     """
 
     try:
@@ -177,13 +184,92 @@ def is_path_blocked(root: Path, path: Path) -> bool:
     if path.is_symlink():
         return True
 
-    if is_sensitive_file(path.name):
+    if is_sensitive_name(path.name):
         return True
 
     if path.suffix.lower() in BLOCKED_EXTENSIONS:
         return True
 
     return False
+
+
+def validate_accessible_path(
+    root: Path,
+    relative_path: str,
+    *,
+    must_be_file: bool = False,
+) -> Path:
+    """
+    Centralized security validation for every file and directory access.
+
+    Resolves ``relative_path`` against ``root`` and returns the resolved path
+    only when every check passes. Raises ``ValueError`` (or
+    ``FileNotFoundError`` when the path does not exist) on the first
+    violation:
+
+    - rejects absolute paths and Windows drives
+    - rejects parent-directory traversal ("..")
+    - rejects any component that is an ignored directory (.git, node_modules,
+      venv, ...)
+    - rejects symbolic links at any component
+    - rejects paths that resolve outside the project root
+    - rejects sensitive files/directories (.env, *.pem, *.key, id_rsa, ...)
+    - rejects blocked extensions (.db, .sqlite, ...)
+    - optionally requires the target to be a regular file
+
+    No file content is read before these checks pass.
+    """
+
+    requested = Path(relative_path)
+
+    if requested.is_absolute() or requested.drive:
+        raise ValueError("Absolute paths are not allowed.")
+
+    if ".." in requested.parts:
+        raise ValueError("Parent directory traversal is not allowed.")
+
+    current = root
+
+    for part in requested.parts:
+        if part in ("", "."):
+            continue
+
+        if part in IGNORED_DIRS:
+            raise ValueError(f"Access to '{part}' is not allowed.")
+
+        current = current / part
+
+        if current.is_symlink():
+            raise ValueError("Symbolic links are not allowed.")
+
+    resolved = current.resolve(strict=True)
+
+    if not resolved.is_relative_to(root):
+        raise ValueError("Requested path is outside the project.")
+
+    if is_sensitive_name(resolved.name):
+        raise ValueError(
+            f"Access to sensitive file '{resolved.name}' is not allowed."
+        )
+
+    if resolved.suffix.lower() in BLOCKED_EXTENSIONS:
+        raise ValueError(
+            f"Access to '{resolved.suffix}' files is not allowed."
+        )
+
+    if must_be_file and not resolved.is_file():
+        raise ValueError("The requested path is not a file.")
+
+    return resolved
+
+
+def validate_path_components(root: Path, relative_path: str) -> Path:
+    """
+    Validate a relative path. Thin wrapper around the centralized
+    ``validate_accessible_path``; kept for backwards compatibility.
+    """
+
+    return validate_accessible_path(root, relative_path)
 
 
 def validate_project_path(project_path: str) -> Path:
@@ -216,44 +302,9 @@ def validate_project_path(project_path: str) -> Path:
     return root
 
 
-def validate_path_components(root: Path, relative_path: str) -> Path:
-    """
-    Validate a relative path and reject:
-    - Parent directory traversal
-    - Absolute paths
-    - Symbolic links
-    - Ignored directories (.git, node_modules, etc.)
-    - Paths outside the project
-    """
-
-    requested = Path(relative_path)
-
-    if requested.is_absolute() or requested.drive:
-        raise ValueError("Absolute paths are not allowed.")
-
-    if ".." in requested.parts:
-        raise ValueError("Parent directory traversal is not allowed.")
-
-    current = root
-
-    for part in requested.parts:
-        if part in ("", "."):
-            continue
-
-        if part in IGNORED_DIRS:
-            raise ValueError(f"Access to '{part}' is not allowed.")
-
-        current = current / part
-
-        if current.is_symlink():
-            raise ValueError("Symbolic links are not allowed.")
-
-    resolved = current.resolve(strict=True)
-
-    if not resolved.is_relative_to(root):
-        raise ValueError("Requested path is outside the project.")
-
-    return resolved
+# ==========================================
+# Tool 1: List Files
+# ==========================================
 
 
 
@@ -379,13 +430,7 @@ def read_file(
     try:
         root = validate_project_path(project_path)
 
-        target = validate_path_components(root, file_path)
-
-        if not target.is_file():
-            return "Error: The requested path is not a file."
-
-        if is_path_blocked(root, target):
-            return "Error: Reading this file is not allowed."
+        target = validate_accessible_path(root, file_path, must_be_file=True)
 
         file_size = target.stat().st_size
 
